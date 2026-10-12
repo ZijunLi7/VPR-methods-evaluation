@@ -48,8 +48,65 @@ def read_images_paths(dataset_folder):
     return images_paths
 
 
+def evenly_subsample_paths(paths, max_samples):
+    """Return up to max_samples paths distributed over the full sequence."""
+    if max_samples is None or max_samples >= len(paths):
+        return paths
+    indices = np.arange(max_samples, dtype=np.int64) * len(paths) // max_samples
+    return [paths[index] for index in indices]
+
+
+def subsample_database_paths(database_paths, query_paths, max_samples, use_labels):
+    """Sample the database while retaining nearest entries for sampled queries."""
+    if max_samples is None or max_samples >= len(database_paths):
+        return database_paths
+    if not use_labels:
+        return evenly_subsample_paths(database_paths, max_samples)
+
+    database_utms = np.asarray(
+        [(path.split("@")[1], path.split("@")[2]) for path in database_paths], dtype=float
+    )
+    query_utms = np.asarray(
+        [(path.split("@")[1], path.split("@")[2]) for path in query_paths], dtype=float
+    )
+    nearest = NearestNeighbors(n_neighbors=1, n_jobs=-1).fit(database_utms)
+    nearest_indices = nearest.kneighbors(query_utms, return_distance=False).ravel()
+
+    selected = list(dict.fromkeys(int(index) for index in nearest_indices))
+    if len(selected) > max_samples:
+        selected = evenly_subsample_paths(selected, max_samples)
+    else:
+        selected_set = set(selected)
+        fill_candidates = np.arange(max_samples, dtype=np.int64) * len(database_paths) // max_samples
+        for index in fill_candidates:
+            index = int(index)
+            if index not in selected_set:
+                selected.append(index)
+                selected_set.add(index)
+                if len(selected) == max_samples:
+                    break
+        if len(selected) < max_samples:
+            for index in range(len(database_paths)):
+                if index not in selected_set:
+                    selected.append(index)
+                    selected_set.add(index)
+                    if len(selected) == max_samples:
+                        break
+
+    return [database_paths[index] for index in sorted(selected)]
+
+
 class TestDataset(data.Dataset):
-    def __init__(self, database_folder, queries_folder, positive_dist_threshold=25, image_size=None, use_labels=True):
+    def __init__(
+        self,
+        database_folder,
+        queries_folder,
+        positive_dist_threshold=25,
+        image_size=None,
+        use_labels=True,
+        max_database_samples=None,
+        max_query_samples=None,
+    ):
         """Dataset with images from database and queries, used for validation and test.
         Parameters
         ----------
@@ -62,8 +119,13 @@ class TestDataset(data.Dataset):
         """
         super().__init__()
 
-        self.database_paths = read_images_paths(database_folder)
-        self.queries_paths = read_images_paths(queries_folder)
+        all_database_paths = read_images_paths(database_folder)
+        self.queries_paths = evenly_subsample_paths(
+            read_images_paths(queries_folder), max_query_samples
+        )
+        self.database_paths = subsample_database_paths(
+            all_database_paths, self.queries_paths, max_database_samples, use_labels
+        )
 
         self.images_paths = list(self.database_paths) + list(self.queries_paths)
 
@@ -91,12 +153,14 @@ class TestDataset(data.Dataset):
                 [(path.split("@")[1], path.split("@")[2]) for path in self.queries_paths]
             ).astype(float)
 
-            # Find positives_per_query, which are within positive_dist_threshold (default 25 meters)
-            knn = NearestNeighbors(n_jobs=-1)
-            knn.fit(self.database_utms)
-            self.positives_per_query = knn.radius_neighbors(
-                self.queries_utms, radius=positive_dist_threshold, return_distance=False
-            )
+            # Find positives_per_query, which are within positive_dist_threshold (default 25 meters).
+            # Keep the fitted index so positives at additional thresholds can be
+            # obtained without rebuilding it or extracting descriptors again.
+            self._positives_knn = NearestNeighbors(n_jobs=-1)
+            self._positives_knn.fit(self.database_utms)
+            self._positives_cache = {}
+            self.positive_dist_threshold = positive_dist_threshold
+            self.positives_per_query = self.get_positives(positive_dist_threshold)
 
         transformations = [
             transforms.ToTensor(),
@@ -118,5 +182,13 @@ class TestDataset(data.Dataset):
     def __repr__(self):
         return f"< #queries: {self.num_queries}; #database: {self.num_database} >"
 
-    def get_positives(self):
-        return self.positives_per_query
+    def get_positives(self, positive_dist_threshold=None):
+        """Return database positives for every query at the requested radius."""
+        if positive_dist_threshold is None:
+            positive_dist_threshold = self.positive_dist_threshold
+
+        if positive_dist_threshold not in self._positives_cache:
+            self._positives_cache[positive_dist_threshold] = self._positives_knn.radius_neighbors(
+                self.queries_utms, radius=positive_dist_threshold, return_distance=False
+            )
+        return self._positives_cache[positive_dist_threshold]

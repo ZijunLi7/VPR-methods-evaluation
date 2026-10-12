@@ -16,6 +16,22 @@ import vpr_models
 from test_dataset import TestDataset
 
 
+def collate_images_by_shape(batch):
+    """Stack images of equal shape while preserving a larger logical batch.
+
+    Some datasets contain multiple native camera resolutions. A standard
+    DataLoader collate fails when a batch crosses a resolution boundary, while
+    resizing would alter the evaluation images. Returning one tensor per shape
+    keeps native resolution and only splits the exceptional mixed batch.
+    """
+    groups = {}
+    for image, index in batch:
+        images, indices = groups.setdefault(tuple(image.shape), ([], []))
+        images.append(image)
+        indices.append(index)
+    return [(torch.stack(images), torch.as_tensor(indices)) for images, indices in groups.values()]
+
+
 def main(args):
     start_time = datetime.now()
 
@@ -37,33 +53,48 @@ def main(args):
     test_ds = TestDataset(
         args.database_folder,
         args.queries_folder,
-        positive_dist_threshold=args.positive_dist_threshold,
+        # Use the largest threshold as the default for saved visualizations.
+        positive_dist_threshold=max(args.positive_dist_threshold),
         image_size=args.image_size,
         use_labels=args.use_labels,
+        max_database_samples=args.max_database_samples,
+        max_query_samples=args.max_query_samples,
     )
+    if args.max_database_samples is not None or args.max_query_samples is not None:
+        logger.warning("Sample limits are enabled; Recall values are for a smoke-test subset, not the full dataset")
     logger.info(f"Testing on {test_ds}")
 
     with torch.inference_mode():
         logger.debug("Extracting database descriptors for evaluation/testing")
         database_subset_ds = Subset(test_ds, list(range(test_ds.num_database)))
         database_dataloader = DataLoader(
-            dataset=database_subset_ds, num_workers=args.num_workers, batch_size=args.batch_size
+            dataset=database_subset_ds,
+            num_workers=args.num_workers,
+            batch_size=args.batch_size,
+            collate_fn=collate_images_by_shape,
         )
         all_descriptors = np.empty((len(test_ds), args.descriptors_dimension), dtype="float32")
-        for images, indices in tqdm(database_dataloader):
-            descriptors = model(images.to(args.device))
-            descriptors = descriptors.cpu().numpy()
-            all_descriptors[indices.numpy(), :] = descriptors
+        for image_batches in tqdm(database_dataloader):
+            for images, indices in image_batches:
+                descriptors = model(images.to(args.device))
+                descriptors = descriptors.cpu().numpy()
+                all_descriptors[indices.numpy(), :] = descriptors
 
-        logger.debug("Extracting queries descriptors for evaluation/testing using batch size 1")
+        logger.debug("Extracting queries descriptors for evaluation/testing")
         queries_subset_ds = Subset(
             test_ds, list(range(test_ds.num_database, test_ds.num_database + test_ds.num_queries))
         )
-        queries_dataloader = DataLoader(dataset=queries_subset_ds, num_workers=args.num_workers, batch_size=1)
-        for images, indices in tqdm(queries_dataloader):
-            descriptors = model(images.to(args.device))
-            descriptors = descriptors.cpu().numpy()
-            all_descriptors[indices.numpy(), :] = descriptors
+        queries_dataloader = DataLoader(
+            dataset=queries_subset_ds,
+            num_workers=args.num_workers,
+            batch_size=args.batch_size,
+            collate_fn=collate_images_by_shape,
+        )
+        for image_batches in tqdm(queries_dataloader):
+            for images, indices in image_batches:
+                descriptors = model(images.to(args.device))
+                descriptors = descriptors.cpu().numpy()
+                all_descriptors[indices.numpy(), :] = descriptors
 
     queries_descriptors = all_descriptors[test_ds.num_database :]
     database_descriptors = all_descriptors[: test_ds.num_database]
@@ -83,18 +114,19 @@ def main(args):
 
     # For each query, check if the predictions are correct
     if args.use_labels:
-        positives_per_query = test_ds.get_positives()
-        recalls = np.zeros(len(args.recall_values))
-        for query_index, preds in enumerate(predictions):
-            for i, n in enumerate(args.recall_values):
-                if np.any(np.isin(preds[:n], positives_per_query[query_index])):
-                    recalls[i:] += 1
-                    break
+        for positive_dist_threshold in args.positive_dist_threshold:
+            positives_per_query = test_ds.get_positives(positive_dist_threshold)
+            recalls = np.zeros(len(args.recall_values))
+            for query_index, preds in enumerate(predictions):
+                for i, n in enumerate(args.recall_values):
+                    if np.any(np.isin(preds[:n], positives_per_query[query_index])):
+                        recalls[i:] += 1
+                        break
 
-        # Divide by num_queries and multiply by 100, so the recalls are in percentages
-        recalls = recalls / test_ds.num_queries * 100
-        recalls_str = ", ".join([f"R@{val}: {rec:.1f}" for val, rec in zip(args.recall_values, recalls)])
-        logger.info(recalls_str)
+            # Divide by num_queries and multiply by 100, so the recalls are in percentages
+            recalls = recalls / test_ds.num_queries * 100
+            recalls_str = ", ".join([f"R@{val}: {rec:.1f}" for val, rec in zip(args.recall_values, recalls)])
+            logger.info(f"Positive distance threshold {positive_dist_threshold} m: {recalls_str}")
 
     # Save visualizations of predictions
     if args.num_preds_to_save != 0:

@@ -7,8 +7,9 @@ def parse_arguments():
     parser.add_argument(
         "--positive_dist_threshold",
         type=int,
-        default=25,
-        help="distance (in meters) for a prediction to be considered a positive",
+        nargs="+",
+        default=[25],
+        help="one or more distances (in meters) for a prediction to be considered a positive",
     )
     parser.add_argument(
         "--method",
@@ -58,6 +59,18 @@ def parse_arguments():
         "--batch_size", type=int, default=4, help="set to 1 if database images may have different resolution"
     )
     parser.add_argument(
+        "--max_database_samples",
+        type=int,
+        default=None,
+        help="use at most this many database images for a query-aware smoke test",
+    )
+    parser.add_argument(
+        "--max_query_samples",
+        type=int,
+        default=None,
+        help="uniformly sample at most this many query images for a quick smoke test",
+    )
+    parser.add_argument(
         "--log_dir", type=str, default="default", help="experiment name, output logs will be saved under logs/log_dir"
     )
     parser.add_argument("--device", type=str, default="cuda", choices=["cuda", "cpu"], help="_")
@@ -98,6 +111,16 @@ def parse_arguments():
     args = parser.parse_args()
 
     args.use_labels = not args.no_labels
+
+    if any(threshold <= 0 for threshold in args.positive_dist_threshold):
+        parser.error("--positive_dist_threshold values must be greater than 0")
+    if args.max_database_samples is not None and args.max_database_samples <= 0:
+        parser.error("--max_database_samples must be greater than 0")
+    if args.max_query_samples is not None and args.max_query_samples <= 0:
+        parser.error("--max_query_samples must be greater than 0")
+    # Avoid evaluating and logging the same threshold more than once while
+    # preserving the order supplied on the command line.
+    args.positive_dist_threshold = list(dict.fromkeys(args.positive_dist_threshold))
 
     if args.method == "netvlad":
         if args.backbone not in [None, "VGG16"]:
@@ -211,6 +234,8 @@ def parse_arguments():
     elif args.method == "megaloc":
         args.backbone = "Dinov2"
         args.descriptors_dimension = 8448
+        # MegaLoc's official evaluation preprocessing uses 322x322 inputs.
+        args.image_size = [322, 322]
 
     elif args.method == "boq":
         if args.backbone not in ["ResNet50", "Dinov2"]:
