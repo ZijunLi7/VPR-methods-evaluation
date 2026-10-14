@@ -1,5 +1,7 @@
 import parser
 import sys
+import csv
+import json
 from datetime import datetime
 from pathlib import Path
 
@@ -47,9 +49,6 @@ def main(args):
     )
     logger.info(f"The outputs are being saved in {log_dir}")
 
-    model = vpr_models.get_model(args.method, args.backbone, args.descriptors_dimension)
-    model = model.eval().to(args.device)
-
     test_ds = TestDataset(
         args.database_folder,
         args.queries_folder,
@@ -59,7 +58,22 @@ def main(args):
         use_labels=args.use_labels,
         max_database_samples=args.max_database_samples,
         max_query_samples=args.max_query_samples,
+        images_folder=args.images_folder,
+        query_years=args.query_years,
+        filter_dist_threshold=min(args.positive_dist_threshold),
     )
+    if test_ds.year_split_summary is not None:
+        logger.info(f'Year split and closed-set query filtering: {test_ds.year_split_summary}')
+        (log_dir / 'year_split_summary.json').write_text(json.dumps(test_ds.year_split_summary, indent=2) + '\n')
+        with (log_dir / 'filtered_queries.csv').open('w', newline='') as stream:
+            writer = csv.DictWriter(stream, fieldnames=['image_path', 'nearest_database_distance_m', 'filter_threshold_m', 'reason'])
+            writer.writeheader()
+            writer.writerows(test_ds.filtered_queries)
+        for split, paths in [('database', test_ds.database_paths), ('queries', test_ds.queries_paths)]:
+            (log_dir / f'{split}_images_paths.txt').write_text('\n'.join(paths) + '\n')
+
+    model = vpr_models.get_model(args.method, args.backbone, args.descriptors_dimension)
+    model = model.eval().to(args.device)
     if args.max_database_samples is not None or args.max_query_samples is not None:
         logger.warning("Sample limits are enabled; Recall values are for a smoke-test subset, not the full dataset")
     logger.info(f"Testing on {test_ds}")

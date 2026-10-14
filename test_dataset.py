@@ -1,4 +1,6 @@
 import os
+import re
+from collections import Counter
 from glob import glob
 
 import numpy as np
@@ -32,6 +34,8 @@ def read_images_paths(dataset_folder):
         with open(file_with_paths, "r") as file:
             images_paths = file.read().splitlines()
         images_paths = [dataset_folder + "/" + path for path in images_paths]
+        if not images_paths:
+            raise ValueError(f"Image path list is empty: {file_with_paths}; wait for preprocessing to complete")
         # Sanity check that paths within the file exist
         if not os.path.exists(images_paths[0]):
             raise FileNotFoundError(
@@ -46,6 +50,35 @@ def read_images_paths(dataset_folder):
         if len(images_paths) == 0:
             raise FileNotFoundError(f"Directory {dataset_folder} does not contain any images")
     return images_paths
+
+
+def read_utms(paths):
+    return np.asarray([(os.path.basename(path).split('@')[1], os.path.basename(path).split('@')[2])
+                       for path in paths], dtype=float)
+
+
+def split_paths_by_year(paths, query_years):
+    """Read YYYYMM capture labels from the standard filename's timestamp field."""
+    database, queries, counts, ids, zones = [], [], Counter(), set(), set()
+    for path in paths:
+        fields = os.path.basename(path).split('@')
+        if len(fields) < 15 or not re.fullmatch(r'[0-9]{4}(?:0[1-9]|1[0-2])', fields[13]):
+            raise ValueError(f"Expected YYYYMM timestamp in filename field 13: {path}")
+        year = int(fields[13][:4])
+        if year == 0 or not fields[7] or fields[7] in ids:
+            raise ValueError(f"Invalid capture year or duplicate/empty panorama ID: {path}")
+        ids.add(fields[7])
+        zones.add((int(fields[3]), fields[4] >= 'N'))
+        counts[year] += 1
+        (queries if year in query_years else database).append(path)
+    missing = set(query_years) - set(counts)
+    if missing:
+        raise ValueError(f"Query years absent from images: {sorted(missing)}")
+    if len(zones) != 1:
+        raise ValueError('Runtime year splitting requires one UTM zone and hemisphere')
+    if not database or not queries:
+        raise ValueError('Year split must contain both database and query images')
+    return database, queries, dict(sorted(counts.items()))
 
 
 def evenly_subsample_paths(paths, max_samples):
@@ -63,12 +96,8 @@ def subsample_database_paths(database_paths, query_paths, max_samples, use_label
     if not use_labels:
         return evenly_subsample_paths(database_paths, max_samples)
 
-    database_utms = np.asarray(
-        [(path.split("@")[1], path.split("@")[2]) for path in database_paths], dtype=float
-    )
-    query_utms = np.asarray(
-        [(path.split("@")[1], path.split("@")[2]) for path in query_paths], dtype=float
-    )
+    database_utms = read_utms(database_paths)
+    query_utms = read_utms(query_paths)
     nearest = NearestNeighbors(n_neighbors=1, n_jobs=-1).fit(database_utms)
     nearest_indices = nearest.kneighbors(query_utms, return_distance=False).ravel()
 
@@ -99,13 +128,16 @@ def subsample_database_paths(database_paths, query_paths, max_samples, use_label
 class TestDataset(data.Dataset):
     def __init__(
         self,
-        database_folder,
-        queries_folder,
+        database_folder=None,
+        queries_folder=None,
         positive_dist_threshold=25,
         image_size=None,
         use_labels=True,
         max_database_samples=None,
         max_query_samples=None,
+        images_folder=None,
+        query_years=None,
+        filter_dist_threshold=None,
     ):
         """Dataset with images from database and queries, used for validation and test.
         Parameters
@@ -119,18 +151,26 @@ class TestDataset(data.Dataset):
         """
         super().__init__()
 
-        all_database_paths = read_images_paths(database_folder)
+        self.year_split_summary = None
+        self.filtered_queries = []
+        if images_folder is not None:
+            if not query_years or not use_labels or database_folder is not None or queries_folder is not None:
+                raise ValueError('Year splitting requires labelled images, query years, and no explicit split folders')
+            all_database_paths, all_query_paths, year_counts = split_paths_by_year(read_images_paths(images_folder), query_years)
+            self.year_split_summary = {'query_years': sorted(set(query_years)), 'year_counts': year_counts,
+                                       'database_before_sampling': len(all_database_paths),
+                                       'queries_before_sampling': len(all_query_paths)}
+        else:
+            if query_years is not None:
+                raise ValueError('query_years requires images_folder')
+            all_database_paths = read_images_paths(database_folder)
+            all_query_paths = read_images_paths(queries_folder)
         self.queries_paths = evenly_subsample_paths(
-            read_images_paths(queries_folder), max_query_samples
+            all_query_paths, max_query_samples
         )
         self.database_paths = subsample_database_paths(
             all_database_paths, self.queries_paths, max_database_samples, use_labels
         )
-
-        self.images_paths = list(self.database_paths) + list(self.queries_paths)
-
-        self.num_database = len(self.database_paths)
-        self.num_queries = len(self.queries_paths)
 
         if use_labels:
             # Read UTM coordinates, which must be contained within the paths
@@ -138,20 +178,15 @@ class TestDataset(data.Dataset):
             try:
                 # This is just a sanity check
                 image_path = self.database_paths[0]
-                utm_east = float(image_path.split("@")[1])
-                utm_north = float(image_path.split("@")[2])
+                utm_east, utm_north = read_utms([image_path])[0]
             except:
                 raise ValueError(
                     "The path of images should be path/to/file/@utm_east@utm_north@...@.jpg "
                     f"but it is {image_path}, which does not contain the UTM coordinates."
                 )
 
-            self.database_utms = np.array(
-                [(path.split("@")[1], path.split("@")[2]) for path in self.database_paths]
-            ).astype(float)
-            self.queries_utms = np.array(
-                [(path.split("@")[1], path.split("@")[2]) for path in self.queries_paths]
-            ).astype(float)
+            self.database_utms = read_utms(self.database_paths)
+            self.queries_utms = read_utms(self.queries_paths)
 
             # Find positives_per_query, which are within positive_dist_threshold (default 25 meters).
             # Keep the fitted index so positives at additional thresholds can be
@@ -160,7 +195,31 @@ class TestDataset(data.Dataset):
             self._positives_knn.fit(self.database_utms)
             self._positives_cache = {}
             self.positive_dist_threshold = positive_dist_threshold
+            if images_folder is not None:
+                radius = positive_dist_threshold if filter_dist_threshold is None else filter_dist_threshold
+                if not 0 < radius <= positive_dist_threshold:
+                    raise ValueError('Filter distance must be positive and no larger than the evaluation radius')
+                mask = np.array([len(p) > 0 for p in self.get_positives(radius)])
+                rejected = np.flatnonzero(~mask)
+                if len(rejected):
+                    distances = self._positives_knn.kneighbors(self.queries_utms[rejected], n_neighbors=1)[0][:, 0]
+                    self.filtered_queries = [{'image_path': self.queries_paths[i], 'nearest_database_distance_m': float(distance),
+                                              'filter_threshold_m': radius, 'reason': 'no_positive_within_threshold'}
+                                             for i, distance in zip(rejected, distances)]
+                self.year_split_summary.update(database_after_sampling=len(self.database_paths),
+                                               queries_before_filter=len(self.queries_paths),
+                                               filter_threshold_m=radius, filtered_queries=len(rejected),
+                                               retained_queries=int(mask.sum()))
+                if not mask.any():
+                    raise ValueError(f'All {len(mask)} queries have no database positives within {radius} m')
+                self.queries_paths = [path for path, keep in zip(self.queries_paths, mask) if keep]
+                self.queries_utms = self.queries_utms[mask]
+                self._positives_cache = {}
             self.positives_per_query = self.get_positives(positive_dist_threshold)
+
+        self.images_paths = list(self.database_paths) + list(self.queries_paths)
+        self.num_database = len(self.database_paths)
+        self.num_queries = len(self.queries_paths)
 
         transformations = [
             transforms.ToTensor(),

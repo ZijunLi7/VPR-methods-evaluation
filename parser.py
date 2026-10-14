@@ -52,8 +52,10 @@ def parse_arguments():
         help="_",
     )
     parser.add_argument("--descriptors_dimension", type=int, default=None, help="_")
-    parser.add_argument("--database_folder", type=str, required=True, help="path/to/database")
-    parser.add_argument("--queries_folder", type=str, required=True, help="path/to/queries")
+    parser.add_argument("--database_folder", type=str, help="path/to/database")
+    parser.add_argument("--queries_folder", type=str, help="path/to/queries")
+    parser.add_argument("--images_folder", type=str, help="Unified image folder for runtime capture-year splitting")
+    parser.add_argument("--query_years", type=int, nargs="+", help="Capture years used as queries; all other years become database")
     parser.add_argument("--num_workers", type=int, default=4, help="_")
     parser.add_argument(
         "--batch_size", type=int, default=4, help="set to 1 if database images may have different resolution"
@@ -111,6 +113,17 @@ def parse_arguments():
     args = parser.parse_args()
 
     args.use_labels = not args.no_labels
+
+    if args.images_folder is not None:
+        if args.database_folder is not None or args.queries_folder is not None:
+            parser.error("--images_folder cannot be combined with --database_folder/--queries_folder")
+        if not args.query_years or not args.use_labels:
+            parser.error("Year splitting requires --query_years and labelled images (omit --no_labels)")
+        if any(year < 1 or year > 9999 for year in args.query_years):
+            parser.error("--query_years must be between 1 and 9999")
+        args.query_years = sorted(set(args.query_years))
+    elif args.query_years is not None or args.database_folder is None or args.queries_folder is None:
+        parser.error("Use --images_folder with --query_years, or both --database_folder and --queries_folder")
 
     if any(threshold <= 0 for threshold in args.positive_dist_threshold):
         parser.error("--positive_dist_threshold values must be greater than 0")

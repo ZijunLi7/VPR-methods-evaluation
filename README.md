@@ -24,6 +24,20 @@ which will generate visual predictions for each query under `logs/toy_experiment
 
 You can also use this on your own dataset (or any two directories) simply changing the paths parameters.
 
+## Runtime year split for Taipei101
+
+Prepare all panoramas once as 90-degree square forward views using `format_taipei101.py` in the downloader project, then choose query years when evaluating:
+
+```bash
+python3 main.py --method=cosplace --backbone=ResNet18 --descriptors_dimension=512 \
+    --images_folder=../VPR-datasets-downloader/datasets/taipei101_forward/images/all \
+    --query_years 2024 2025 --positive_dist_threshold 25
+```
+
+All other capture years become database. Queries without a positive in the actual database are filtered before feature extraction and excluded from the Recall denominator. With multiple distance thresholds, filtering uses the smallest threshold so the same retained queries have positives at every threshold. Filtering happens after optional sample limits, and never deletes prepared images. Logs include `year_split_summary.json`, `filtered_queries.csv`, and the actual database/query path lists.
+
+This mode requires labelled filenames with a `YYYYMM` timestamp and unique panorama IDs; it cannot be combined with explicit split folders or `--no_labels`. The existing two-folder mode, including St Lucia, is unchanged. See [the preprocessing guide](../VPR-datasets-downloader/README.md#taipei101-forward-view-preprocessing) for output layout and commands.
+
 ## Basic use on a labelled dataset
 
 The code is designed to be readily used with our [VPR-datasets-downloader](https://github.com/gmberton/VPR-datasets-downloader) repo, so that using a few simple commands you can download a dataset and test any model on it. The VPR-datasets-downloader code allows you to download multiple VPR datasets that are automatically formatted in the same format as used by this repo.
